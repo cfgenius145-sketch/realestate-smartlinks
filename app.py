@@ -1,6 +1,9 @@
 import streamlit as st
 import qrcode, requests, os
 from io import BytesIO
+import os, requests
+BASE_REDIRECT_URL = st.secrets.get("BASE_REDIRECT_URL", os.environ.get("BASE_REDIRECT_URL", "http://127.0.0.1:8000"))
+
 
 st.set_page_config(page_title="🏡 Real Estate SmartLinks", page_icon="🏡", layout="wide")
 st.title("🏡 Real Estate SmartLinks")
