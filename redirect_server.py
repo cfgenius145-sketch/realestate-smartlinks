@@ -56,7 +56,7 @@ def create_link(data: CreateLinkIn):
         (data.original_url, code, created),
     )
     conn.commit()
-    short_url = f"{base_url_hint()}/{code}"
+    short_url = f"{PUBLIC_BASE_URL}/{code}"
     return {"original_url": data.original_url, "short_code": code, "short_url": short_url, "created_at": created, "clicks": 0}
 
 # --- API: list links ---
