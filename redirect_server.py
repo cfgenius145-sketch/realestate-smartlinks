@@ -4,6 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 import hashlib, sqlite3, time
+import os
+
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+
 
 app = FastAPI(title="Real Estate SmartLinks Redirect")
 
