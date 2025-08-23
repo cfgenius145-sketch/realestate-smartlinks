@@ -174,3 +174,7 @@ def report_pdf(short_code: str):
 
     return Response(content=buf.getvalue(), media_type="application/pdf")
 
+@app.get("/api/report/{short_code}")
+def report_pdf(short_code: str):
+    ...
+    return Response(content=buf.getvalue(), media_type="application/pdf")
