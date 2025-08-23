@@ -1,8 +1,4 @@
-fastapi
-uvicorn[standard]
-pydantic
+streamlit
 requests
-reportlab
 qrcode
 pillow
-matplotlib
