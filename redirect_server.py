@@ -1,11 +1,12 @@
-# redirect_server.py — known-good minimal backend
+# redirect_server.py — SmartLinks Backend (Pacific time + pretty dates)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
 
+from datetime import datetime
+import pytz
 import sqlite3, os, random, string, io, tempfile
 
 # Headless plotting for charts in PDFs
@@ -19,15 +20,36 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-app = FastAPI(title="SmartLinks Backend")
+app = FastAPI(title="SmartLinks Redirect & Analytics")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----- Timezone helpers (Sacramento / Pacific) -----
+PACIFIC = pytz.timezone("America/Los_Angeles")
+
+def now_local_iso() -> str:
+    """Store timestamps with timezone offset."""
+    return datetime.now(PACIFIC).isoformat()
+
+def to_pacific_str(ts: str) -> str:
+    """
+    Convert an ISO timestamp (with or without tz) to a friendly
+    'Aug 23, 2025 01:44 PM PDT' string in Pacific time.
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return ts
+    if dt.tzinfo is None:                   # old rows saved as naive → assume UTC
+        dt = pytz.utc.localize(dt)
+    dt_pacific = dt.astimezone(PACIFIC)
+    return dt_pacific.strftime("%b %d, %Y %I:%M %p %Z")
 
 # ----- DB -----
 conn = sqlite3.connect("realestate_links.db", check_same_thread=False)
@@ -90,19 +112,20 @@ async def create_link(data: CreateLinkIn, request: Request):
         raise HTTPException(status_code=402, detail="Free plan limit reached. Please upgrade to Pro.")
 
     code = make_code()
-    created = datetime.now().isoformat()
+    created = now_local_iso()
     c.execute(
         "INSERT INTO links (original_url, short_code, created_at, owner_ip) VALUES (?,?,?,?)",
         (data.original_url, code, created, ip)
     )
     conn.commit()
 
-    base = str(request.base_url).rstrip("/")  # use actual public URL
+    base = str(request.base_url).rstrip("/")
     return {
         "original_url": data.original_url,
         "short_code": code,
         "short_url": f"{base}/{code}",
-        "created_at": created,
+        "created_at": created,                       # raw ISO (with tz)
+        "created_pretty": to_pacific_str(created),   # friendly local string
         "clicks": 0
     }
 
@@ -119,6 +142,7 @@ def list_links(request: Request):
             "short_code": code,
             "short_url": f"{base}/{code}",
             "created_at": created,
+            "created_pretty": to_pacific_str(created),
             "clicks": clicks
         })
     return out
@@ -134,7 +158,7 @@ async def go(short_code: str, request: Request):
     ip = request.headers.get("x-forwarded-for", request.client.host)
     ua = request.headers.get("user-agent", "")
     dev = device_from_ua(ua)
-    ts = datetime.now().isoformat()
+    ts = now_local_iso()
 
     c.execute(
         "INSERT INTO clicks (short_code, ts, ip, user_agent, device, city, country) VALUES (?,?,?,?,?,?,?)",
@@ -151,6 +175,9 @@ def _clicks_by_day(short_code):
     for (ts,) in rows:
         try:
             dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = pytz.utc.localize(dt)
+            dt = dt.astimezone(PACIFIC)
             counts[dt.weekday()] += 1
         except:
             pass
@@ -172,6 +199,9 @@ def report_pdf(short_code: str, request: Request):
 
     c.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM clicks WHERE short_code=?", (short_code,))
     total, first_ts, last_ts = c.fetchone() or (0, None, None)
+    first_pretty = to_pacific_str(first_ts) if first_ts else "-"
+    last_pretty  = to_pacific_str(last_ts)  if last_ts  else "-"
+
     mobile, desktop = _device_split(short_code)
     days, counts = _clicks_by_day(short_code)
 
@@ -206,7 +236,9 @@ def report_pdf(short_code: str, request: Request):
     story.append(Paragraph(f"<b>Listing:</b> {dest}<br/><b>Short Code:</b> {short_code}", styles["Normal"]))
     story.append(Spacer(1, 6))
     story.append(Paragraph(
-        f"<b>Total Views:</b> {total} &nbsp;&nbsp; <b>First:</b> {first_ts or '-'} &nbsp;&nbsp; <b>Last:</b> {last_ts or '-'}",
+        f"<b>Total Views:</b> {total} &nbsp;&nbsp; "
+        f"<b>First:</b> {first_pretty} &nbsp;&nbsp; "
+        f"<b>Last:</b> {last_pretty}",
         styles["Normal"]
     ))
     story.append(Spacer(1, 10))
