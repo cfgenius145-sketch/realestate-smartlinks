@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
-requests
 pydantic
+requests
 reportlab
 qrcode
+pillow
 matplotlib
