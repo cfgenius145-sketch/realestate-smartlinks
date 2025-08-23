@@ -5,6 +5,19 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import io, matplotlib.pyplot as plt, tempfile, csv
 import hashlib, time  # add if missing
+import os, random, string
+
+CODE_LEN = 5  # shorten from 6 to 5 safely
+ALPHABET = string.ascii_letters + string.digits  # base62
+
+def make_code(seed: str) -> str:
+    """Generate a unique base62 short code of length CODE_LEN."""
+    while True:
+        code = ''.join(random.choice(ALPHABET) for _ in range(CODE_LEN))
+        c.execute("SELECT 1 FROM links WHERE short_code = ?", (code,))
+        if not c.fetchone():
+            return code
+
 
 # --- Short-code generator (5 chars) ---
 def make_code(seed: str) -> str:
