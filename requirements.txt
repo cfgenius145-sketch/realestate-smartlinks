@@ -1,6 +1,6 @@
-streamlit
 fastapi
-uvicorn
+uvicorn[standard]
+reportlab
 qrcode
 requests
-
+pydantic
