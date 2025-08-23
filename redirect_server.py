@@ -4,8 +4,11 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import io, matplotlib.pyplot as plt, tempfile, csv
-import hashlib, time  # add if missing
-import os, random, string
+import hashlib, time 
+import random
+import string
+
+
 
 CODE_LEN = 5  # shorten from 6 to 5 safely
 ALPHABET = string.ascii_letters + string.digits  # base62
