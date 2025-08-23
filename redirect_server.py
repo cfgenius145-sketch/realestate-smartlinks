@@ -5,6 +5,14 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import io, matplotlib.pyplot as plt, tempfile, csv
 
+def make_code(seed: str) -> str:
+    while True:
+        code = hashlib.md5((seed + str(time.time())).encode()).hexdigest()[:5]  # was [:6]
+        c.execute("SELECT 1 FROM links WHERE short_code = ?", (code,))
+        if not c.fetchone():
+            return code
+
+
 def _clicks_by_day(short_code):
     rows = c.execute("SELECT ts FROM clicks WHERE short_code=? ORDER BY ts", (short_code,)).fetchall()
     # buckets Mon..Sun
