@@ -4,10 +4,12 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import io, matplotlib.pyplot as plt, tempfile, csv
+import hashlib, time  # add if missing
 
+# --- Short-code generator (5 chars) ---
 def make_code(seed: str) -> str:
     while True:
-        code = hashlib.md5((seed + str(time.time())).encode()).hexdigest()[:5]  # was [:6]
+        code = hashlib.md5((seed + str(time.time())).encode()).hexdigest()[:5]  # <- length here
         c.execute("SELECT 1 FROM links WHERE short_code = ?", (code,))
         if not c.fetchone():
             return code
