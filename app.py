@@ -1,4 +1,4 @@
-# app.py — SmartLinks for Real Estate (FULL FILE, with robust PDF download)
+# app.py — SmartLinks for Real Estate (FULL FILE, simple + reliable)
 
 import os
 from io import BytesIO
@@ -30,22 +30,6 @@ def generate_qr_png(url: str) -> bytes:
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-
-def fetch_report_pdf(short_code: str) -> bytes | None:
-    try:
-        r = requests.get(f"{BASE_REDIRECT_URL}/api/report/{short_code}", timeout=60)
-        if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-            return r.content
-        else:
-            st.error(f"Report failed: {r.status_code} {r.text}")
-            return None
-    except Exception as e:
-        st.error(f"Report request error: {e}")
-        return None
-
-# Session cache for PDFs so buttons persist after rerun
-if "pdf_cache" not in st.session_state:
-    st.session_state["pdf_cache"] = {}
 
 # --------------- Header -----------------
 st.markdown("# 🏡 SmartLinks for Real Estate")
@@ -126,44 +110,10 @@ else:
                 f"**SmartLink:** {short_url}  \n"
                 f"**Clicks:** {row['clicks']} &nbsp;&nbsp; | &nbsp;&nbsp; **Created:** {row['created_at']}"
             )
-            b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-            with b1:
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
                 st.link_button("Open SmartLink", short_url, use_container_width=True)
-
-            # Robust: open PDF directly in a new tab (always works)
-            with b2:
-                st.link_button(
-                    "Open PDF in new tab",
-                    f"{BASE_REDIRECT_URL}/api/report/{code}",
-                    use_container_width=True,
-                )
-
-            # Generate + cache bytes → then show a Download button reliably
-            with b3:
-                if st.button("Generate Seller Report (PDF)", key=f"pdf_{code}", use_container_width=True):
-                    with st.spinner("Building report…"):
-                        pdf_bytes = fetch_report_pdf(code)
-                    if pdf_bytes:
-                        st.session_state["pdf_cache"][code] = pdf_bytes
-                        st.success("Report ready ↓")
-
-            with b4:
-                # If cached, render the download button on every rerun
-                if code in st.session_state["pdf_cache"]:
-                    st.download_button(
-                        "⬇️ Download Report (PDF)",
-                        data=st.session_state["pdf_cache"][code],
-                        file_name=f"Seller_Report_{code}.pdf",
-                        mime="application/pdf",
-                        key=f"dl_{code}",
-                        use_container_width=True,
-                    )
-                else:
-                    st.caption("Generate first to enable download")
-
-            # Raw CSV export
-            st.link_button(
-                "Download CSV (raw clicks)",
-                f"{BASE_REDIRECT_URL}/api/report/{code}/csv",
-                use_container_width=True,
-            )
+            with c2:
+                st.link_button("⬇️ Seller Report (PDF)", f"{BASE_REDIRECT_URL}/api/report/{code}", use_container_width=True)
+            with c3:
+                st.link_button("📑 Download CSV", f"{BASE_REDIRECT_URL}/api/report/{code}/csv", use_container_width=True)
