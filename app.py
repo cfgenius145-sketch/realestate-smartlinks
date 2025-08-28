@@ -1,8 +1,7 @@
-# app.py — SmartLinks for Real Estate (BRANDED POLISH EDITION)
+# app.py — SmartLinks for Real Estate (BRANDED POLISH EDITION — FIXED)
 
 import os
 from io import BytesIO
-from datetime import datetime
 
 import requests
 import qrcode
@@ -35,9 +34,7 @@ st.set_page_config(
 st.markdown(
     f"""
     <style>
-      :root {{
-        --brand: {PRIMARY_HEX};
-      }}
+      :root {{ --brand: {PRIMARY_HEX}; }}
       .brand-badge {{
         display:inline-flex;align-items:center;gap:.5rem;
         padding:.35rem .6rem;border-radius:999px;
@@ -78,7 +75,7 @@ with st.sidebar:
     st.markdown(f"### {BRAND_NAME}")
     st.caption("QR + Short Links + AI Seller Reports")
 
-    # “Login-lite” email capture (not auth; just remembered + shown)
+    # “Login-lite” email capture (remember only; no passwords)
     if "agent_email" not in st.session_state:
         st.session_state.agent_email = ""
 
@@ -86,7 +83,7 @@ with st.sidebar:
         "Your email (for Pro/unlock)",
         value=st.session_state.agent_email,
         placeholder="you@brokerage.com",
-        help="We’ll use this when we enable auto-upgrade via Stripe (no password needed).",
+        help="We’ll use this when auto-upgrade via Stripe is enabled (no password needed).",
     )
 
     if st.session_state.agent_email.strip():
@@ -111,13 +108,15 @@ with col_title:
     st.caption("Create SmartLinks + QR, track engagement, and wow sellers with AI reports.")
 with col_cta:
     st.markdown("<div class='brand-cta'>", unsafe_allow_html=True)
-    st.link_button("✨ Try Free (3 links)", "#create", use_container_width=True)
+    # This button just scrolls user attention; no in-page anchors in Streamlit
+    st.button("✨ Try Free (3 links)", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
 
 # ---------------- Create SmartLink ----------------
-st.markdown("### 🔗 Create a SmartLink", help="Paste a property link (Zillow/MLS/YouTube/your site).", anchor="create")
+st.markdown("### 🔗 Create a SmartLink")
+st.caption("Paste a property link (Zillow / MLS / YouTube / your site).")
 
 with st.container():
     url = st.text_input("Property URL", placeholder="https://www.zillow.com/homedetails/...", label_visibility="collapsed")
@@ -128,7 +127,6 @@ with st.container():
                 st.error("Please paste a property URL.")
             else:
                 try:
-                    # Send email as header once we wire the backend to use it
                     headers = {}
                     if st.session_state.agent_email.strip():
                         headers["X-User-Email"] = st.session_state.agent_email.strip()
@@ -147,7 +145,7 @@ with st.container():
 
                     with st.container():
                         st.success("✅ SmartLink created")
-                        st.text_input("SmartLink", value=short_url, key=f"short_{data['short_code']}", label_visibility="visible")
+                        st.text_input("SmartLink", value=short_url, key=f"short_{data['short_code']}")
                         qr_bytes = generate_qr_png(short_url)
                         qc1, qc2 = st.columns([1, 1])
                         with qc1:
@@ -168,10 +166,11 @@ with st.container():
         st.markdown(
             """
             **Tips**
-            - Use on open house flyers, yard signs, business cards
-            - Post the SmartLink on IG/FB/YouTube
+            - Use on open house flyers, yard signs, business cards  
+            - Post the SmartLink on IG/FB/YouTube  
             - Always share the **short** link to track clicks
-            """)
+            """
+        )
 st.divider()
 
 # ---------------- My Links + Reports ----------------
@@ -187,23 +186,22 @@ else:
         created_pretty = row.get("created_pretty") or row.get("created_at") or "-"
         clicks = row["clicks"]
 
-        with st.container():
-            st.markdown(
-                f"""
-                <div class="card">
-                  <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;">
-                    <div>
-                      <div><strong>Original:</strong> {row['original_url']}</div>
-                      <div><strong>SmartLink:</strong> <a href="{short_url}" target="_blank">{short_url}</a></div>
-                      <div class="muted">Created: {created_pretty} · Clicks: {clicks}</div>
-                    </div>
-                    <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
-                      <a href="{short_url}" target="_blank"><button>Open</button></a>
-                      <a href="{BASE_REDIRECT_URL}/api/report/{code}" target="_blank"><button>⬇️ PDF Report</button></a>
-                      <a href="{BASE_REDIRECT_URL}/api/report/{code}/csv" target="_blank"><button>📑 CSV</button></a>
-                    </div>
-                  </div>
+        st.markdown(
+            f"""
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+                <div>
+                  <div><strong>Original:</strong> {row['original_url']}</div>
+                  <div><strong>SmartLink:</strong> <a href="{short_url}" target="_blank">{short_url}</a></div>
+                  <div class="muted">Created: {created_pretty} · Clicks: {clicks}</div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+                  <a href="{short_url}" target="_blank"><button>Open</button></a>
+                  <a href="{BASE_REDIRECT_URL}/api/report/{code}" target="_blank"><button>⬇️ PDF Report</button></a>
+                  <a href="{BASE_REDIRECT_URL}/api/report/{code}/csv" target="_blank"><button>📑 CSV</button></a>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
