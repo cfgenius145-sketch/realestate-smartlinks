@@ -1,4 +1,4 @@
-# redirect_server.py — SmartLinks Backend (visual-matched PDF)
+# redirect_server.py — SmartLinks Backend (cap fix + polished PDF)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from datetime import datetime
 import pytz
-import sqlite3, os, random, string, io, tempfile, collections
+import sqlite3, os, random, string, io, tempfile, collections, re
 
 # Headless plotting
 import matplotlib
@@ -24,11 +24,12 @@ from reportlab.lib import colors
 app = FastAPI(title="SmartLinks Redirect & Analytics")
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware(
+        allow_origins=["*"],  # tighten later
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 )
 
 # ----- Timezone helpers (Sacramento / Pacific) -----
@@ -96,6 +97,35 @@ class CreateLinkIn(BaseModel):
 
 FREE_LIMIT_PER_IP = int(os.getenv("FREE_LIMIT_PER_IP", "3"))
 
+# ---- Owner key (cap) helper ----
+_ip_re = re.compile(r'^\s*([^,\s]+)')
+
+def get_owner_key(request: Request) -> str:
+    """
+    Determine the 'owner' key for rate-limiting.
+    - If client sends X-User-Email (future), you can switch to email-based here.
+    - Otherwise use first IP from X-Forwarded-For. Fallback to request.client.host.
+    """
+    # Uncomment when you add email-based provisioning:
+    # email = request.headers.get("X-User-Email")
+    # if email:
+    #     return f"email:{email.strip().lower()}"
+
+    xff = request.headers.get("x-forwarded-for", "") or request.headers.get("X-Forwarded-For", "")
+    ip = None
+    if xff:
+        m = _ip_re.match(xff)
+        if m:
+            ip = m.group(1).strip()
+    if not ip:
+        ip = (request.client.host or "").strip()
+    # Normalize IPv6 brackets/ports (rare)
+    ip = ip.replace("[","").replace("]","")
+    if ":" in ip and ip.count(":") == 1:
+        # likely host:port — strip port
+        ip = ip.split(":")[0]
+    return f"ip:{ip or 'unknown'}"
+
 # ----- Health -----
 @app.get("/")
 def root():
@@ -104,16 +134,19 @@ def root():
 # ----- Create Link -----
 @app.post("/api/links")
 async def create_link(data: CreateLinkIn, request: Request):
-    ip = request.headers.get("x-forwarded-for", request.client.host)
-    c.execute("SELECT COUNT(*) FROM links WHERE owner_ip = ?", (ip,))
-    if c.fetchone()[0] >= FREE_LIMIT_PER_IP:
+    owner_key = get_owner_key(request)
+
+    # Count links for this owner
+    c.execute("SELECT COUNT(*) FROM links WHERE owner_ip = ?", (owner_key,))
+    count = c.fetchone()[0] or 0
+    if count >= FREE_LIMIT_PER_IP:
         raise HTTPException(status_code=402, detail="Free plan limit reached. Please upgrade to Pro.")
 
     code = make_code()
     created = now_local_iso()
     c.execute(
         "INSERT INTO links (original_url, short_code, created_at, owner_ip) VALUES (?,?,?,?)",
-        (data.original_url, code, created, ip)
+        (data.original_url, code, created, owner_key)
     )
     conn.commit()
 
@@ -153,7 +186,7 @@ async def go(short_code: str, request: Request):
     if not row:
         raise HTTPException(status_code=404, detail="SmartLink not found")
 
-    ip = request.headers.get("x-forwarded-for", request.client.host)
+    ip = get_owner_key(request).replace("ip:", "", 1)  # store raw ip-ish value for clicks
     ua = request.headers.get("user-agent", "")
     dev = device_from_ua(ua)
     ts = now_local_iso()
@@ -204,18 +237,17 @@ def stats_bundle(short_code):
         "last_pretty": to_pacific_str(last_ts) if last_ts else "-"
     }
 
-# ----- Style tokens (match V0 look) -----
-PURPLE = colors.HexColor("#7C3AED")      # primary
-PURPLE_SOFT = colors.HexColor("#EEE7FF") # light panel tint
+# ----- Style tokens -----
+PURPLE = colors.HexColor("#7C3AED")
+PURPLE_SOFT = colors.HexColor("#EEE7FF")
 SLATE_BG = colors.HexColor("#F6F7FB")
 BORDER = colors.HexColor("#E5E7EB")
 TEXT = colors.HexColor("#111827")
 MUTED = colors.HexColor("#6B7280")
 
-# ----- PDF report -----
+# ----- PDF report (same polished layout) -----
 @app.get("/api/report/{short_code}")
 def report_pdf(short_code: str, request: Request):
-    # fetch link
     c.execute("SELECT original_url, created_at FROM links WHERE short_code=?", (short_code,))
     row = c.fetchone()
     if not row:
@@ -223,51 +255,35 @@ def report_pdf(short_code: str, request: Request):
     dest, created_at = row
     stats = stats_bundle(short_code)
 
-    # charts dir
     tmpdir = tempfile.mkdtemp()
     activity_path = os.path.join(tmpdir, "daily.png")
 
-    # Daily Activity chart (Mon..Sun) with nicer empty state
     if sum(stats["day_counts"]) == 0:
-        # create a soft empty panel
         fig = plt.figure(figsize=(6.2, 2.1))
-        ax = fig.add_subplot(111)
-        ax.axis("off")
+        ax = fig.add_subplot(111); ax.axis("off")
         ax.text(0.5, 0.5, "No activity yet", ha="center", va="center", fontsize=12, color="#9CA3AF")
-        fig.tight_layout()
-        fig.savefig(activity_path, dpi=200, transparent=True)
-        plt.close(fig)
+        fig.tight_layout(); fig.savefig(activity_path, dpi=200, transparent=True); plt.close(fig)
     else:
         ymax = max(stats["day_counts"])
         fig = plt.figure(figsize=(6.2, 2.1))
         ax = fig.add_subplot(111)
         ax.bar(stats["days"], stats["day_counts"])
-        ax.set_title("Daily Activity")
-        ax.set_ylim(0, ymax * 1.25 if ymax > 0 else 1)
-        fig.tight_layout()
-        fig.savefig(activity_path, dpi=200)
-        plt.close(fig)
+        ax.set_title("Daily Activity"); ax.set_ylim(0, ymax * 1.25 if ymax > 0 else 1)
+        fig.tight_layout(); fig.savefig(activity_path, dpi=200); plt.close(fig)
 
-    # derived metrics
-    total = stats["total"]
+    total = stats["total"]; scans = total
     unique_visitors = stats["unique_visitors"]
-    scans = total  # in MVP, redirects == scans
     mobile, desktop, tablet = stats["mobile"], stats["desktop"], stats["tablet"]
-    def pct(n): 
-        return int(round(100 * n / max(1, total)))
+    def pct(n): return int(round(100 * n / max(1, total)))
 
-    # insights
     peak_idx = max(range(7), key=lambda i: stats["day_counts"][i]) if sum(stats["day_counts"])>0 else None
     peak_day = stats["days"][peak_idx] if peak_idx is not None else "—"
     tip = "Share QR codes during open houses and on social—weekend traffic tends to peak." if peak_day in ["Sat","Sun"] else "Promote your QR on flyers and listing descriptions to boost weekday traffic."
 
-    # PDF doc
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
     h_white = ParagraphStyle('h_white', parent=styles['Normal'], textColor=colors.white, fontSize=10)
-    title_white = ParagraphStyle('title_white', parent=styles['Title'], textColor=colors.white, fontSize=16, alignment=1)
-    small_muted = ParagraphStyle('small_muted', fontSize=9, textColor=MUTED)
     label_muted = ParagraphStyle('label_muted', fontSize=9, textColor=MUTED, alignment=1)
     value_dark = ParagraphStyle('value_dark', fontSize=18, textColor=TEXT, alignment=1)
     heading = ParagraphStyle('heading', fontSize=12, textColor=TEXT, spaceAfter=6)
@@ -275,7 +291,6 @@ def report_pdf(short_code: str, request: Request):
 
     story = []
 
-    # Header card (purple)
     header = Table(
         [[Paragraph(f"Property: <u>{dest}</u>", h_white),
           Paragraph(f"Generated: {to_pacific_str(now_local_iso())}", h_white)]],
@@ -290,16 +305,12 @@ def report_pdf(short_code: str, request: Request):
         ("BOTTOMPADDING",(0,0),(-1,-1), 10),
         ("ROUNDEDCORNERS",(0,0),(-1,-1), 8),
     ]))
-    story.append(header)
-    story.append(Spacer(1, 10))
+    story.append(header); story.append(Spacer(1, 10))
 
-    # Metric cards row (white cards on light bg)
     def metric_card(title, value):
-        t = Table(
-            [[Paragraph(f"<b>{value}</b>", value_dark)],
-             [Paragraph(title, label_muted)]],
-            colWidths=[(doc.width/3)-12]
-        )
+        t = Table([[Paragraph(f"<b>{value}</b>", value_dark)],
+                   [Paragraph(title, label_muted)]],
+                  colWidths=[(doc.width/3)-12])
         t.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,-1), colors.white),
             ("BOX",(0,0),(-1,-1), 0.6, BORDER),
@@ -320,10 +331,8 @@ def report_pdf(short_code: str, request: Request):
         ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
         ("LEFTPADDING",(0,0),(-1,-1),4), ("RIGHTPADDING",(0,0),(-1,-1),4)
     ]))
-    story.append(metrics_row)
-    story.append(Spacer(1, 12))
+    story.append(metrics_row); story.append(Spacer(1, 12))
 
-    # Daily Activity panel (soft gray background)
     activity_panel = Table(
         [[Paragraph("Daily Activity", heading)],
          [Image(activity_path, width=doc.width-16, height=140)]],
@@ -337,41 +346,32 @@ def report_pdf(short_code: str, request: Request):
         ("TOPPADDING",(0,0),(-1,-1), 8),
         ("BOTTOMPADDING",(0,0),(-1,-1), 10),
     ]))
-    story.append(activity_panel)
-    story.append(Spacer(1, 12))
+    story.append(activity_panel); story.append(Spacer(1, 12))
 
-    # Device Breakdown with right-aligned percent bars
-    story.append(Paragraph("Device Breakdown", heading))
-
-    def percent_row(name, pct):
-        bar_total = int((doc.width - 220))  # space for labels + %
-        filled = int(bar_total * (pct/100.0))
+    def percent_row(name, pctv):
+        bar_total = int((doc.width - 220))
+        filled = int(bar_total * (pctv/100.0))
         bar_tbl = Table([["", ""]], colWidths=[filled, max(0, bar_total-filled)], rowHeights=[8])
         bar_tbl.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(0,0), PURPLE),
             ("BACKGROUND",(1,0),(1,0), colors.HexColor("#E5E7EB")),
             ("BOX",(0,0),(-1,-1), 0.25, colors.HexColor("#D1D5DB")),
         ]))
-        row = Table([[Paragraph(name, normal),
-                      bar_tbl,
-                      Paragraph(f"{pct}%", ParagraphStyle('pct', fontSize=10, textColor=TEXT, alignment=2))]],
+        row = Table([[Paragraph(name, normal), bar_tbl, Paragraph(f"{pctv}%", ParagraphStyle('pct', fontSize=10, textColor=TEXT, alignment=2))]],
                     colWidths=[120, bar_total, 60])
         row.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
         return row
 
-    story.append(percent_row("Mobile", pct(mobile)))
-    story.append(Spacer(1, 6))
-    story.append(percent_row("Desktop", pct(desktop)))
-    story.append(Spacer(1, 6))
-    story.append(percent_row("Tablet", pct(tablet)))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("Device Breakdown", heading))
+    story.append(percent_row("Mobile", pct(mobile))); story.append(Spacer(1, 6))
+    story.append(percent_row("Desktop", pct(desktop))); story.append(Spacer(1, 6))
+    story.append(percent_row("Tablet", pct(tablet))); story.append(Spacer(1, 12))
 
-    # AI Insights box
     insights_lines = [
         f"Peak engagement: <b>{peak_day}</b>",
         f"Mobile vs Desktop: <b>{pct(mobile)}%</b> / <b>{pct(desktop)}%</b>",
         f"First activity: <b>{stats['first_pretty']}</b> — Last: <b>{stats['last_pretty']}</b>",
-        f"Recommended: {tip}",
+        "Recommended: Share QR codes during open houses, on flyers, and in listing descriptions.",
     ]
     insights_tbl = Table(
         [[Paragraph("🧠 AI Insights", ParagraphStyle('h2', fontSize=12, textColor=PURPLE))]] +
@@ -386,8 +386,7 @@ def report_pdf(short_code: str, request: Request):
         ("TOPPADDING",(0,0),(-1,-1), 8),
         ("BOTTOMPADDING",(0,0),(-1,-1), 8),
     ]))
-    story.append(insights_tbl)
-    story.append(Spacer(1, 10))
+    story.append(insights_tbl); story.append(Spacer(1, 10))
 
     story.append(Paragraph("<i>Powered by SmartLinks — Turning clicks into clients</i>",
                            ParagraphStyle("foot", fontSize=9, textColor=MUTED, alignment=1)))
@@ -404,4 +403,3 @@ def report_csv(short_code: str):
     for r in rows:
         out.write(",".join([str(x) if x is not None else "" for x in r]) + "\n")
     return Response(content=out.getvalue(), media_type="text/csv")
-
