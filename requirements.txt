@@ -7,3 +7,4 @@ qrcode
 pillow
 matplotlib
 pytz
+user-agents
