@@ -404,3 +404,4 @@ def report_csv(short_code: str):
     for r in rows:
         out.write(",".join([str(x) if x is not None else "" for x in r]) + "\n")
     return Response(content=out.getvalue(), media_type="text/csv")
+
