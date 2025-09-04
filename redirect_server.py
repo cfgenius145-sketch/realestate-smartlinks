@@ -1,4 +1,4 @@
-# redirect_server.py — SmartLinks Backend (robust mobile detection + polished PDF + cap)
+# redirect_server.py — SmartLinks Backend (stable: no new deps; cap fix; polished PDF)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
@@ -8,9 +8,6 @@ from pydantic import BaseModel
 from datetime import datetime
 import pytz
 import sqlite3, os, random, string, io, tempfile, collections, re
-
-# Robust UA parsing
-from user_agents import parse as ua_parse
 
 # Headless plotting
 import matplotlib
@@ -28,7 +25,7 @@ app = FastAPI(title="SmartLinks Redirect & Analytics")
 
 app.add_middleware(
     CORSMiddleware(
-        allow_origins=["*"],  # tighten later
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -65,11 +62,14 @@ def make_code() -> str:
         c.execute("SELECT 1 FROM links WHERE short_code = ?", (code,))
         if not c.fetchone(): return code
 
-# Robust device classifier
-def classify_device(ua_str: str) -> str:
-    ua = ua_parse(ua_str or "")
-    if ua.is_tablet: return "tablet"
-    if ua.is_mobile: return "mobile"
+# Simple, dependency-free device classifier (good enough for MVP)
+def classify_device(ua: str) -> str:
+    u = (ua or "").lower()
+    tablet_tokens = ["ipad", "tablet", "kindle", "silk/"]
+    mobile_tokens = ["iphone","android","mobile","ipod","iemobile","opera mini",
+                     "fbav","instagram","tiktok","micromessenger","pinterest","line"]
+    if any(t in u for t in tablet_tokens): return "tablet"
+    if any(t in u for t in mobile_tokens): return "mobile"
     return "desktop"
 
 # ===== Models & Limits =====
@@ -78,7 +78,7 @@ class CreateLinkIn(BaseModel):
 
 FREE_LIMIT_PER_IP = int(os.getenv("FREE_LIMIT_PER_IP", "3"))
 
-# Owner key (cap) — first IP from XFF
+# Owner key for the free cap — first IP from X-Forwarded-For
 _ip_re = re.compile(r'^\s*([^,\s]+)')
 def get_owner_key(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for", "") or request.headers.get("X-Forwarded-For", "")
@@ -88,7 +88,8 @@ def get_owner_key(request: Request) -> str:
         if m: ip = m.group(1).strip()
     if not ip: ip = (request.client.host or "").strip()
     ip = ip.replace("[","").replace("]","")
-    if ":" in ip and ip.count(":") == 1: ip = ip.split(":")[0]
+    if ":" in ip and ip.count(":") == 1:
+        ip = ip.split(":")[0]
     return f"ip:{ip or 'unknown'}"
 
 # ===== Health =====
@@ -288,4 +289,3 @@ def report_csv(short_code: str):
     out = io.StringIO(); out.write("timestamp,ip,user_agent,device,city,country\n")
     for r in rows: out.write(",".join([str(x) if x is not None else "" for x in r]) + "\n")
     return Response(content=out.getvalue(), media_type="text/csv")
-
