@@ -6,3 +6,7 @@ python-dotenv
 requests
 user-agents
 stripe
+qrcode
+Pillow
+reportlab
+streamlit
