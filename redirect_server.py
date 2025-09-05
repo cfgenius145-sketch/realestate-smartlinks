@@ -220,4 +220,3 @@ def _upgrade_user(owner_token: str | None, email: str | None):
             cur.execute("UPDATE users SET plan='pro', updated_at=? WHERE email=?", (now, email))
     conn.commit()
     conn.close()
-
