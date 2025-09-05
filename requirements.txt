@@ -1,8 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn
 pydantic
-reportlab
-matplotlib
-pytz
-qrcode
-pillow
+stripe>=5
+python-dotenv
