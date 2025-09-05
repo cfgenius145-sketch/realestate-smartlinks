@@ -1,18 +1,8 @@
-# backend
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
-sqlite-utils
-
-# shared
-requests
-python-dotenv
-
-# device detection & outputs
-user-agents
-qrcode
-Pillow
 reportlab
-
-# frontend
-streamlit
+matplotlib
+pytz
+qrcode
+pillow
