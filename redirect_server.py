@@ -1,391 +1,404 @@
-# SmartLinks backend (ground-up)
-# FastAPI + SQLite + device logging + free-cap + CSV + PDF + QR + Stripe (optional)
-# Start on Render with: uvicorn redirect_server:app --host 0.0.0.0 --port $PORT
+# redirect_server.py — SmartLinks Backend (clean MVP + Stripe unlock)
+# FastAPI + SQLite + ReportLab + Stripe subscription unlock
+# Features:
+# - Per-browser owner token (no login). Frontend sends X-Owner-Token header.
+# - Free plan: 3 links. Pro: unlimited.
+# - Create/list links (scoped to owner), redirect+log clicks, PDF/CSV report.
+# - Stripe Checkout (/api/checkout) and webhook (/stripe/webhook) to upgrade owner plan.
 
-import os, io, csv, sqlite3
-from datetime import datetime, timezone
-from typing import Optional, Tuple
-
-from fastapi import FastAPI, Request, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import RedirectResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel
+from typing import Optional
 
-# Third-party libs
-import qrcode
-from PIL import Image
-from reportlab.pdfgen import canvas
+import os, sqlite3, random, string, io, tempfile, collections, re
+from datetime import datetime
+import pytz
+
+# Plotting headless
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# PDF
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-import stripe  # used only if keys provided
+# Stripe
+import stripe
 
-try:
-    from user_agents import parse as parse_ua
-except Exception:  # fallback if lib import fails
-    def parse_ua(_):
-        class U:
-            is_tablet = False
-            is_mobile = False
-            is_pc = True
-            is_bot = False
-        return U()
-
-# ---------------- Config ----------------
-DB_PATH = os.getenv("DB_PATH", "smartlinks.db")
-MAX_FREE_LINKS = int(os.getenv("MAX_FREE_LINKS", "3"))
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
+# ---------- Config ----------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID   = os.getenv("STRIPE_PRICE_ID", "")  # price_XXXX (recurring $29/mo)
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-if STRIPE_API_KEY:
-    stripe.api_key = STRIPE_API_KEY
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
-# ---------------- DB helpers ----------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+FREE_LIMIT = int(os.getenv("FREE_LIMIT_PER_IP", "3"))  # reuse your existing var name
 
-def init_db():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS links (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner_token TEXT,
-        original_url TEXT NOT NULL,
-        short_code TEXT UNIQUE,
-        created_at TEXT,
-        plan TEXT DEFAULT 'free'
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS clicks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        link_id INTEGER NOT NULL,
-        ts TEXT NOT NULL,
-        ip TEXT,
-        user_agent TEXT,
-        device_type TEXT,
-        FOREIGN KEY(link_id) REFERENCES links(id)
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE,
-        owner_token TEXT UNIQUE,
-        plan TEXT DEFAULT 'free',
-        created_at TEXT,
-        updated_at TEXT
-    )""")
-    conn.commit(); conn.close()
+PACIFIC = pytz.timezone("America/Los_Angeles")
 
-# ---------------- App ----------------
-app = FastAPI(title="SmartLinks Backend")
+def now_local_iso(): return datetime.now(PACIFIC).isoformat()
+
+def to_pacific_str(ts: Optional[str]) -> str:
+    if not ts: return "-"
+    try: dt = datetime.fromisoformat(ts)
+    except Exception: return ts
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    return dt.astimezone(PACIFIC).strftime("%b %d, %Y %I:%M %p %Z")
+
+# ---------- App ----------
+app = FastAPI(title="SmartLinks Redirect & Analytics")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # MVP; tighten for prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware(allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 )
-init_db()
 
-# ---------------- Utils ----------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ---------- DB ----------
+conn = sqlite3.connect("realestate_links.db", check_same_thread=False)
+c = conn.cursor()
 
-def get_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for")
-    if xff: return xff.split(",")[0].strip()
-    xri = request.headers.get("x-real-ip")
-    if xri: return xri.strip()
-    return request.client.host if request.client else "unknown"
+c.execute("""CREATE TABLE IF NOT EXISTS owners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_key TEXT UNIQUE,
+  plan TEXT DEFAULT 'free',     -- 'free' or 'pro'
+  created_at TEXT
+)""")
 
-def parse_device(request: Request) -> Tuple[str, str]:
-    ua_str = (request.headers.get("user-agent") or "")[:512]
-    ua = parse_ua(ua_str)
-    if getattr(ua, "is_tablet", False): kind = "tablet"
-    elif getattr(ua, "is_mobile", False): kind = "mobile"
-    elif getattr(ua, "is_bot", False): kind = "bot"
-    elif getattr(ua, "is_pc", False): kind = "desktop"
-    else: kind = "unknown"
-    return ua_str, kind
+c.execute("""CREATE TABLE IF NOT EXISTS links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  original_url TEXT,
+  short_code  TEXT UNIQUE,
+  created_at  TEXT,
+  owner_key   TEXT
+)""")
 
-def absolute_short_url(request: Request, short_code: str) -> str:
-    if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/r/{short_code}"
-    base = str(request.base_url).rstrip("/")
-    return f"{base}/r/{short_code}"
+c.execute("""CREATE TABLE IF NOT EXISTS clicks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  short_code TEXT,
+  ts         TEXT,
+  ip         TEXT,
+  user_agent TEXT,
+  device     TEXT,
+  city       TEXT,
+  country    TEXT
+)""")
+conn.commit()
 
-def owner_effective_plan(cur: sqlite3.Cursor, owner_token: str, email: str) -> str:
-    cur.execute("SELECT plan FROM users WHERE owner_token=? OR email=?", (owner_token, email))
-    r = cur.fetchone()
-    return (r["plan"] if r else "free") or "free"
+# ---------- Helpers ----------
+CODE_LEN = 5
+ALPHABET = string.ascii_letters + string.digits
 
-def upgrade_user_to_pro(owner_token: Optional[str], email: Optional[str]):
-    conn = get_db(); cur = conn.cursor(); n = now_iso()
-    if owner_token:
-        cur.execute("SELECT id FROM users WHERE owner_token=?", (owner_token,))
-        r = cur.fetchone()
-        if r is None:
-            cur.execute("INSERT INTO users (email, owner_token, plan, created_at, updated_at) VALUES (?,?,?,?,?)",
-                        (email, owner_token, "pro", n, n))
-        else:
-            cur.execute("UPDATE users SET plan='pro', email=COALESCE(?,email), updated_at=? WHERE owner_token=?",
-                        (email, n, owner_token))
-        cur.execute("UPDATE links SET plan='pro' WHERE owner_token=?", (owner_token,))
-    elif email:
-        cur.execute("SELECT id FROM users WHERE email=?", (email,))
-        r = cur.fetchone()
-        if r is None:
-            cur.execute("INSERT INTO users (email, plan, created_at, updated_at) VALUES (?,?,?,?)",
-                        (email, "pro", n, n))
-        else:
-            cur.execute("UPDATE users SET plan='pro', updated_at=? WHERE email=?", (n, email))
-    conn.commit(); conn.close()
+def make_code() -> str:
+    while True:
+        code = ''.join(random.choice(ALPHABET) for _ in range(CODE_LEN))
+        c.execute("SELECT 1 FROM links WHERE short_code=?", (code,))
+        if not c.fetchone():
+            return code
 
-# ---------------- Schemas ----------------
-class CreateLinkIn(BaseModel):
-    owner_token: str
-    original_url: str
-    email: Optional[str] = None
+def classify_device(ua: str) -> str:
+    u = (ua or "").lower()
+    if any(t in u for t in ["ipad","tablet","kindle","silk/"]): return "tablet"
+    if any(t in u for t in ["iphone","android","mobile","ipod","iemobile","opera mini","fbav","instagram","tiktok","micromessenger","pinterest","line"]):
+        return "mobile"
+    return "desktop"
 
-class CheckoutIn(BaseModel):
-    owner_token: str
-    email: Optional[str] = None
+_ip_re = re.compile(r'^\s*([^,\s]+)')
 
-# ---------------- Health ----------------
-@app.get("/health")
-def health(request: Request):
-    return {
-        "ok": True,
-        "db": DB_PATH,
-        "env": {
-            "PUBLIC_BASE_URL": bool(PUBLIC_BASE_URL),
-            "STRIPE_API_KEY": bool(STRIPE_API_KEY),
-            "STRIPE_PRICE_ID": bool(STRIPE_PRICE_ID),
-            "STRIPE_WEBHOOK_SECRET": bool(STRIPE_WEBHOOK_SECRET),
-        },
-        "example_redirect": absolute_short_url(request, "DEMO1234")
-    }
-
-# ---------------- Core Endpoints ----------------
-@app.post("/api/links")
-def create_link(payload: CreateLinkIn):
-    owner = (payload.owner_token or "").strip()
-    url = (payload.original_url or "").strip()
-    email = (payload.email or "").strip().lower()
-    if not owner or not url:
-        raise HTTPException(status_code=400, detail="owner_token and original_url required")
-
-    conn = get_db(); cur = conn.cursor(); n = now_iso()
-
-    # upsert user (bind email to owner)
-    if email:
-        cur.execute("SELECT id FROM users WHERE email=? OR owner_token=?", (email, owner))
-        r = cur.fetchone()
-        if r is None:
-            cur.execute("INSERT INTO users (email, owner_token, plan, created_at, updated_at) VALUES (?,?,?,?,?)",
-                        (email, owner, "free", n, n))
-        else:
-            cur.execute("UPDATE users SET email=?, owner_token=?, updated_at=? WHERE id=?",
-                        (email, owner, n, r["id"]))
+def ensure_owner(owner_key: str):
+    c.execute("SELECT plan FROM owners WHERE owner_key=?", (owner_key,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO owners (owner_key, plan, created_at) VALUES (?,?,?)",
+                  (owner_key, 'free', now_local_iso()))
         conn.commit()
 
-    plan = owner_effective_plan(cur, owner, email)
+def owner_plan(owner_key: str) -> str:
+    ensure_owner(owner_key)
+    c.execute("SELECT plan FROM owners WHERE owner_key=?", (owner_key,))
+    row = c.fetchone()
+    return row[0] if row else 'free'
 
-    if plan != "pro":
-        cur.execute("SELECT COUNT(*) c FROM links WHERE owner_token=?", (owner,))
-        c = cur.fetchone()["c"]
-        if c >= MAX_FREE_LINKS:
-            raise HTTPException(status_code=402, detail="Free tier limit reached. Upgrade to Pro.")
-
-    short_code = hex(abs(hash(f"{owner}:{url}:{n}")))[2:10]
-    cur.execute("INSERT INTO links (owner_token, original_url, short_code, created_at, plan) VALUES (?,?,?,?,?)",
-                (owner, url, short_code, n, plan))
+def set_owner_plan(owner_key: str, plan: str):
+    ensure_owner(owner_key)
+    c.execute("UPDATE owners SET plan=? WHERE owner_key=?", (plan, owner_key))
     conn.commit()
 
-    cur.execute("SELECT id FROM links WHERE short_code=?", (short_code,))
-    link_id = cur.fetchone()["id"]
-    conn.close()
+# ---------- Schemas ----------
+class CreateLinkIn(BaseModel):
+    original_url: str
 
-    return {"id": link_id, "short_code": short_code, "plan": plan}
+# ---------- Health ----------
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
+# ---------- Owner status ----------
+@app.get("/api/plan")
+def get_plan(x_owner_token: Optional[str] = Header(default=None, alias="X-Owner-Token")):
+    if not x_owner_token:
+        raise HTTPException(400, "Missing owner token")
+    return {"plan": owner_plan(f"tok:{x_owner_token}")}
+
+# ---------- Create link ----------
+@app.post("/api/links")
+def create_link(data: CreateLinkIn, request: Request, x_owner_token: Optional[str] = Header(default=None, alias="X-Owner-Token")):
+    if not x_owner_token:
+        raise HTTPException(400, "Missing owner token")
+    owner = f"tok:{x_owner_token}"
+    ensure_owner(owner)
+    plan = owner_plan(owner)
+
+    if plan != "pro":
+        c.execute("SELECT COUNT(*) FROM links WHERE owner_key=?", (owner,))
+        if (c.fetchone()[0] or 0) >= FREE_LIMIT:
+            raise HTTPException(status_code=402, detail="Free plan limit reached. Please upgrade to Pro.")
+
+    code = make_code()
+    created = now_local_iso()
+    c.execute("INSERT INTO links (original_url, short_code, created_at, owner_key) VALUES (?,?,?,?)",
+              (data.original_url, code, created, owner))
+    conn.commit()
+    base = str(request.base_url).rstrip("/")
+    return {"original_url": data.original_url, "short_code": code,
+            "short_url": f"{base}/{code}", "created_at": created,
+            "created_pretty": to_pacific_str(created), "clicks": 0}
+
+# ---------- List links (owner scope) ----------
 @app.get("/api/links")
-def list_links(owner_token: str = Query(..., description="Owner token to filter")):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""
-        SELECT l.id, l.original_url, l.short_code, l.created_at, l.plan,
-               (SELECT COUNT(*) FROM clicks c WHERE c.link_id=l.id) AS clicks
-        FROM links l
-        WHERE l.owner_token=?
-        ORDER BY l.id DESC
-    """, (owner_token,))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return {"links": rows}
+def list_links(request: Request, x_owner_token: Optional[str] = Header(default=None, alias="X-Owner-Token")):
+    if not x_owner_token:
+        raise HTTPException(400, "Missing owner token")
+    owner = f"tok:{x_owner_token}"
+    ensure_owner(owner)
+    out = []
+    for (orig, code, created) in c.execute(
+        "SELECT original_url, short_code, created_at FROM links WHERE owner_key=? ORDER BY id DESC",
+        (owner,)
+    ):
+        c.execute("SELECT COUNT(*) FROM clicks WHERE short_code=?", (code,))
+        clicks = c.fetchone()[0]
+        base = str(request.base_url).rstrip("/")
+        out.append({"original_url": orig, "short_code": code,
+                    "short_url": f"{base}/{code}",
+                    "created_at": created, "created_pretty": to_pacific_str(created),
+                    "clicks": clicks})
+    return out
 
-@app.get("/r/{short_code}")
-def redirect(short_code: str, request: Request):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT id, original_url FROM links WHERE short_code=?", (short_code,))
-    row = cur.fetchone()
+# ---------- Redirect + click ----------
+@app.get("/{short_code}")
+def go(short_code: str, request: Request):
+    c.execute("SELECT original_url FROM links WHERE short_code=?", (short_code,))
+    row = c.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Link not found")
+        raise HTTPException(404, "SmartLink not found")
+    dest = row[0]
 
-    ua_str, device = parse_device(request)
-    cur.execute("INSERT INTO clicks (link_id, ts, ip, user_agent, device_type) VALUES (?,?,?,?,?)",
-                (row["id"], now_iso(), get_ip(request), ua_str, device))
-    conn.commit(); conn.close()
+    ua = request.headers.get("user-agent", "")
+    dev = classify_device(ua)
+    ip_raw = request.headers.get("x-forwarded-for") or (request.client.host or "")
+    ts = now_local_iso()
+    c.execute("INSERT INTO clicks (short_code, ts, ip, user_agent, device, city, country) VALUES (?,?,?,?,?,?,?)",
+              (short_code, ts, ip_raw, ua, dev, None, None))
+    conn.commit()
+    return RedirectResponse(url=dest)
 
-    return RedirectResponse(url=row["original_url"], status_code=302)
+# ---------- Analytics helpers ----------
+def clicks_for(short_code):
+    return c.execute("SELECT ts, ip, device FROM clicks WHERE short_code=? ORDER BY ts", (short_code,)).fetchall()
 
-# ---------------- Exports ----------------
-@app.get("/api/links/{link_id}/clicks.csv")
-def export_csv(link_id: int):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT id FROM links WHERE id=?", (link_id,))
-    if not cur.fetchone():
-        raise HTTPException(status_code=404, detail="Link not found")
+def stats_bundle(short_code):
+    rows = clicks_for(short_code)
+    total = len(rows)
+    unique_ips = len({ip for (_ts, ip, _d) in rows if ip})
+    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]; counts = [0]*7
+    for ts, _ip, _d in rows:
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None: dt = pytz.utc.localize(dt)
+            counts[dt.astimezone(PACIFIC).weekday()] += 1
+        except: pass
+    dev_counter = collections.Counter([d or "unknown" for _ts,_ip,d in rows])
+    mobile = int(dev_counter.get("mobile", 0))
+    desktop = int(dev_counter.get("desktop", 0))
+    tablet = int(dev_counter.get("tablet", 0))
+    first_ts = rows[0][0] if rows else None; last_ts = rows[-1][0] if rows else None
+    return {"total": total, "unique_visitors": unique_ips, "mobile": mobile, "desktop": desktop, "tablet": tablet,
+            "days": days, "day_counts": counts, "first_pretty": to_pacific_str(first_ts) if first_ts else "-",
+            "last_pretty": to_pacific_str(last_ts) if last_ts else "-"}
 
-    cur.execute("SELECT ts, ip, user_agent, device_type FROM clicks WHERE link_id=? ORDER BY ts ASC", (link_id,))
-    rows = cur.fetchall(); conn.close()
+# ---------- PDF report ----------
+PURPLE = colors.HexColor("#7C3AED"); PURPLE_SOFT = colors.HexColor("#EEE7FF")
+SLATE_BG = colors.HexColor("#F6F7FB"); BORDER = colors.HexColor("#E5E7EB")
+TEXT = colors.HexColor("#111827"); MUTED = colors.HexColor("#6B7280")
 
-    def gen():
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["timestamp_utc", "ip", "user_agent", "device_type"])
-        for r in rows:
-            writer.writerow([r["ts"], r["ip"], r["user_agent"], r["device_type"]])
-        yield output.getvalue()
+@app.get("/api/report/{short_code}")
+def report_pdf(short_code: str, request: Request):
+    c.execute("SELECT original_url FROM links WHERE short_code=?", (short_code,))
+    row = c.fetchone()
+    if not row: raise HTTPException(404, "Unknown short code")
+    dest = row[0]
+    stats = stats_bundle(short_code)
 
-    return StreamingResponse(gen(), media_type="text/csv",
-                             headers={"Content-Disposition": "attachment; filename=clicks.csv"})
+    tmpdir = tempfile.mkdtemp(); activity_path = os.path.join(tmpdir, "daily.png")
+    if sum(stats["day_counts"]) == 0:
+        fig = plt.figure(figsize=(6.2, 2.1)); ax = fig.add_subplot(111); ax.axis("off")
+        ax.text(0.5, 0.5, "No activity yet", ha="center", va="center", fontsize=12, color="#9CA3AF")
+        fig.tight_layout(); fig.savefig(activity_path, dpi=200, transparent=True); plt.close(fig)
+    else:
+        ymax = max(stats["day_counts"])
+        fig = plt.figure(figsize=(6.2, 2.1)); ax = fig.add_subplot(111)
+        ax.bar(stats["days"], stats["day_counts"]); ax.set_title("Daily Activity")
+        ax.set_ylim(0, ymax*1.25 if ymax>0 else 1)
+        fig.tight_layout(); fig.savefig(activity_path, dpi=200); plt.close(fig)
 
-# ---------------- QR Codes ----------------
-@app.get("/api/links/{link_id}/qrcode.png")
-def qr_png(link_id: int, request: Request, box_size: int = 8, border: int = 2):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT short_code FROM links WHERE id=?", (link_id,))
-    row = cur.fetchone(); conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Link not found")
-
-    url = absolute_short_url(request, row["short_code"])
-    qr = qrcode.QRCode(box_size=box_size, border=border)
-    qr.add_data(url); qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png")
-
-# ---------------- PDF Report ----------------
-@app.get("/api/links/{link_id}/report.pdf")
-def report_pdf(link_id: int, request: Request):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT original_url, short_code, created_at FROM links WHERE id=?", (link_id,))
-    link = cur.fetchone()
-    if not link:
-        raise HTTPException(status_code=404, detail="Link not found")
-
-    cur.execute("""
-        SELECT device_type, COUNT(*) c FROM clicks
-        WHERE link_id=? GROUP BY device_type
-    """, (link_id,))
-    dev_counts = { (r["device_type"] or "unknown"): r["c"] for r in cur.fetchall() }
-
-    cur.execute("""
-        SELECT substr(ts,1,10) day, COUNT(*) c FROM clicks
-        WHERE link_id=? GROUP BY day ORDER BY day ASC
-    """, (link_id,))
-    daily = [ (r["day"], r["c"]) for r in cur.fetchall() ]
-    conn.close()
+    total, uniq = stats["total"], stats["unique_visitors"]; scans = total
+    mob, desk, tab = stats["mobile"], stats["desktop"], stats["tablet"]
+    pct = lambda n: int(round(100*n/max(1,total)))
+    peak_idx = max(range(7), key=lambda i: stats["day_counts"][i]) if sum(stats["day_counts"])>0 else None
+    peak_day = stats["days"][peak_idx] if peak_idx is not None else "—"
+    tip = "Share QR codes during open houses and on social—weekend traffic tends to peak." if peak_day in ["Sat","Sun"] else "Promote QR on flyers and listing descriptions to boost weekday traffic."
 
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    width, height = letter
+    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    h_white = ParagraphStyle('h_white', parent=styles['Normal'], textColor=colors.white, fontSize=10)
+    label_muted = ParagraphStyle('label_muted', fontSize=9, textColor=MUTED, alignment=1)
+    value_dark = ParagraphStyle('value_dark', fontSize=18, textColor=TEXT, alignment=1)
+    heading = ParagraphStyle('heading', fontSize=12, textColor=TEXT, spaceAfter=6)
+    normal = ParagraphStyle('normal', fontSize=10, textColor=TEXT)
 
-    # Header
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(1*inch, height - 1*inch, "Seller Report")
-    c.setFont("Helvetica", 11)
-    c.drawString(1*inch, height - 1.3*inch, f"Property URL: {link['original_url']}")
-    c.drawString(1*inch, height - 1.55*inch, f"SmartLink: {absolute_short_url(request, link['short_code'])}")
-    c.drawString(1*inch, height - 1.8*inch, f"Created: {link['created_at']} (UTC)")
+    story = []
+    header = Table([[Paragraph(f"Property: <u>{dest}</u>", h_white),
+                     Paragraph(f"Generated: {to_pacific_str(now_local_iso())}", h_white)]],
+                   colWidths=[doc.width/2-8, doc.width/2-8])
+    header.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1), PURPLE), ("TEXTCOLOR",(0,0),(-1,-1), colors.white),
+        ("LEFTPADDING",(0,0),(-1,-1),12), ("RIGHTPADDING",(0,0),(-1,-1),12),
+        ("TOPPADDING",(0,0),(-1,-1),10), ("BOTTOMPADDING",(0,0),(-1,-1),10),
+        ("ROUNDEDCORNERS",(0,0),(-1,-1),8),
+    ]))
+    story.append(header); story.append(Spacer(1,10))
 
-    # Device split bars
-    y0 = height - 2.4*inch
-    c.setFont("Helvetica-Bold", 12); c.drawString(1*inch, y0, "Device Split")
-    y = y0 - 0.2*inch
-    order = ["desktop", "mobile", "tablet", "bot", "unknown"]
-    max_val = max([dev_counts.get(k,0) for k in order] + [1])
-    for k in order:
-        v = dev_counts.get(k, 0)
-        c.setFont("Helvetica", 11)
-        c.drawString(1*inch, y, f"{k.capitalize():8} {v}")
-        bar_w = 4.5*inch * (v / max_val)
-        c.setFillColor(colors.HexColor("#2F80ED"))
-        c.rect(2.2*inch, y-0.08*inch, bar_w, 0.18*inch, fill=1, stroke=0)
-        c.setFillColor(colors.black)
-        y -= 0.35*inch
+    def card(title, value):
+        t = Table([[Paragraph(f"<b>{value}</b>", value_dark)],[Paragraph(title, label_muted)]],
+                  colWidths=[(doc.width/3)-12])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,-1), colors.white), ("BOX",(0,0),(-1,-1), 0.6, BORDER),
+            ("LEFTPADDING",(0,0),(-1,-1),12), ("RIGHTPADDING",(0,0),(-1,-1),12),
+            ("TOPPADDING",(0,0),(-1,-1),8), ("BOTTOMPADDING",(0,0),(-1,-1),8),
+        ])); return t
 
-    # Daily table (simple)
-    y_table = y - 0.2*inch
-    c.setFont("Helvetica-Bold", 12); c.drawString(1*inch, y_table, "Daily Clicks")
-    y_table -= 0.25*inch
-    c.setFont("Helvetica", 10)
-    if daily:
-        for day, cnt in daily:
-            c.drawString(1*inch, y_table, f"{day}")
-            c.drawString(3*inch, y_table, f"{cnt}")
-            y_table -= 0.22*inch
-            if y_table < 1*inch:
-                c.showPage()
-                y_table = height - 1*inch
-    else:
-        c.drawString(1*inch, y_table, "No clicks yet.")
+    metrics = Table([[card("Total Views", total), card("QR Code Scans", scans), card("Unique Visitors", uniq)]],
+                    colWidths=[doc.width/3-8, doc.width/3-8, doc.width/3-8])
+    metrics.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                                 ("LEFTPADDING",(0,0),(-1,-1),4), ("RIGHTPADDING",(0,0),(-1,-1),4)]))
+    story.append(metrics); story.append(Spacer(1,12))
 
-    c.showPage(); c.save()
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/pdf",
-                             headers={"Content-Disposition": "inline; filename=report.pdf"})
+    panel = Table([[Paragraph("Daily Activity", heading)],
+                   [Image(activity_path, width=doc.width-16, height=140)]],
+                  colWidths=[doc.width-16])
+    panel.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1), SLATE_BG), ("BOX",(0,0),(-1,-1), 0.6, BORDER),
+                               ("LEFTPADDING",(0,0),(-1,-1),12), ("RIGHTPADDING",(0,0),(-1,-1),12),
+                               ("TOPPADDING",(0,0),(-1,-1),8), ("BOTTOMPADDING",(0,0),(-1,-1),10)]))
+    story.append(panel); story.append(Spacer(1,12))
 
-# ---------------- Stripe (optional, safe if not set) ----------------
-@app.post("/api/stripe/checkout")
-def stripe_checkout(payload: CheckoutIn, request: Request):
-    # If not configured, return a placeholder URL (safe mode)
-    if not (STRIPE_API_KEY and STRIPE_PRICE_ID and (PUBLIC_BASE_URL or str(request.base_url))):
-        placeholder = (PUBLIC_BASE_URL or str(request.base_url).rstrip("/")) + "/stripe-not-configured"
-        return {"checkout_url": placeholder}
+    def percent_row(name, p):
+        total_w = int((doc.width - 220)); filled = int(total_w*(p/100.0))
+        bar = Table([["",""]], colWidths=[filled, max(0,total_w-filled)], rowHeights=[8])
+        bar.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(0,0),PURPLE), ("BACKGROUND",(1,0),(1,0),colors.HexColor("#E5E7EB")),
+            ("BOX",(0,0),(-1,-1),0.25,colors.HexColor("#D1D5DB"))
+        ]))
+        row = Table([[Paragraph(name, normal), bar, Paragraph(f"{p}%", ParagraphStyle('pct', fontSize=10, textColor=TEXT, alignment=2))]],
+                    colWidths=[120, total_w, 60])
+        row.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        return row
+
+    story.append(Paragraph("Device Breakdown", heading))
+    story.append(percent_row("Mobile", pct(mob))); story.append(Spacer(1,6))
+    story.append(percent_row("Desktop", pct(desk))); story.append(Spacer(1,6))
+    story.append(percent_row("Tablet", pct(tab))); story.append(Spacer(1,12))
+
+    insights = Table(
+        [[Paragraph("🧠 AI Insights", ParagraphStyle('h2', fontSize=12, textColor=PURPLE))]] +
+        [[Paragraph(f"• Peak engagement: <b>{peak_day}</b>", normal)],
+         [Paragraph(f"• Mobile vs Desktop: <b>{pct(mob)}%</b> / <b>{pct(desk)}%</b>", normal)],
+         [Paragraph(f"• First: <b>{stats['first_pretty']}</b> — Last: <b>{stats['last_pretty']}</b>", normal)],
+         [Paragraph("• Recommended: Share QR codes on flyers, open houses, listings, and social.", normal)]],
+        colWidths=[doc.width]
+    )
+    insights.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1), PURPLE_SOFT), ("BOX",(0,0),(-1,-1),0.6,BORDER),
+        ("LEFTPADDING",(0,0),(-1,-1),12), ("RIGHTPADDING",(0,0),(-1,-1),12),
+        ("TOPPADDING",(0,0),(-1,-1),8), ("BOTTOMPADDING",(0,0),(-1,-1),8),
+    ]))
+    story.append(insights); story.append(Spacer(1,10))
+    story.append(Paragraph("<i>Powered by SmartLinks — Turning clicks into clients</i>",
+                           ParagraphStyle("foot", fontSize=9, textColor=MUTED, alignment=1)))
+    doc.build(story)
+    return Response(content=buf.getvalue(), media_type="application/pdf")
+
+# ---------- CSV ----------
+@app.get("/api/report/{short_code}/csv")
+def report_csv(short_code: str):
+    rows = c.execute("SELECT ts, ip, user_agent, device, city, country FROM clicks WHERE short_code=? ORDER BY ts", (short_code,)).fetchall()
+    out = io.StringIO(); out.write("timestamp,ip,user_agent,device,city,country\n")
+    for r in rows: out.write(",".join([str(x) if x is not None else "" for x in r]) + "\n")
+    return Response(content=out.getvalue(), media_type="text/csv")
+
+# ---------- Stripe: create Checkout Session ----------
+class CheckoutIn(BaseModel):
+    success_url: Optional[str] = None   # optional override
+    cancel_url: Optional[str] = None
+
+@app.post("/api/checkout")
+def create_checkout(request: Request, x_owner_token: Optional[str] = Header(default=None, alias="X-Owner-Token"), body: CheckoutIn = None):
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(500, "Stripe is not configured on the server.")
+    if not x_owner_token:
+        raise HTTPException(400, "Missing owner token")
+    owner = f"tok:{x_owner_token}"
+    ensure_owner(owner)
+
+    # Default success/cancel could be your landing page
+    base_url = str(request.base_url).rstrip("/")
+    success_url = (body.success_url if body and body.success_url else f"{base_url}/")
+    cancel_url  = (body.cancel_url  if body and body.cancel_url  else f"{base_url}/")
 
     session = stripe.checkout.Session.create(
         mode="subscription",
-        success_url=f"{PUBLIC_BASE_URL or str(request.base_url).rstrip('/')}/api/stripe/success",
-        cancel_url=f"{PUBLIC_BASE_URL or str(request.base_url).rstrip('/')}/api/stripe/cancel",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        metadata={"owner_token": payload.owner_token, "email": payload.email or ""},
-        customer_email=payload.email if payload.email else None,
-        allow_promotion_codes=True,
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata={"owner_key": owner},
+        allow_promotion_codes=True
     )
-    return {"checkout_url": session.url}
+    return {"url": session.url}
 
-@app.post("/api/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None, alias="stripe-signature")):
-    if not (STRIPE_WEBHOOK_SECRET and STRIPE_API_KEY):
-        raise HTTPException(status_code=501, detail="Stripe webhook not configured")
-    body = await request.body()
+# ---------- Stripe webhook ----------
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        return JSONResponse({"status":"ignored (no webhook secret set)"}, status_code=200)
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
     try:
-        event = stripe.Webhook.construct_event(body, stripe_signature, STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook verification failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=400)
 
+    # Upgrade owner on successful subscription
     if event["type"] == "checkout.session.completed":
-        obj = event["data"]["object"]
-        md = obj.get("metadata", {}) or {}
-        owner = md.get("owner_token")
-        email = md.get("email") or (obj.get("customer_details") or {}).get("email")
-        upgrade_user_to_pro(owner, email)
+        data = event["data"]["object"]
+        owner = (data.get("metadata") or {}).get("owner_key")
+        if owner:
+            set_owner_plan(owner, "pro")
 
-    return JSONResponse({"received": True})
+    return {"status": "ok"}
